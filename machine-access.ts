@@ -1,8 +1,15 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const CUSTOM_TYPE = "machine-access";
-const STATUS_TYPE = "machine-access-status";
 const RESTRICTED_TOOLS = new Set(["read", "write", "edit", "bash"]);
+
+const SYSTEM_NOTE = [
+  "Machine access is a user-controlled flag. You cannot change it.",
+  "When machine access is off, the tools read, write, edit, and bash are unavailable.",
+  "The user can toggle it at any time with Ctrl+; — before they send a message or while you are looping.",
+  "Watch for developer messages tagged [state_changed] for the current machine_access value and tool list.",
+  "Do not assume the previous state still applies. If you need tools you do not have, ask the user to toggle and send a follow-up.",
+].join(" ");
 
 interface State {
   machineAccess: boolean;
@@ -12,6 +19,7 @@ interface State {
 export default function (pi: ExtensionAPI) {
   let machineAccess = true;
   let toolsBeforeRestrict: string[] | undefined;
+  let lastAnnounced: boolean | undefined;
 
   function persist() {
     pi.appendEntry<State>(CUSTOM_TYPE, { machineAccess, toolsBeforeRestrict });
@@ -25,20 +33,10 @@ export default function (pi: ExtensionAPI) {
       }
       return;
     }
-
     if (!toolsBeforeRestrict) {
       toolsBeforeRestrict = pi.getActiveTools();
     }
     pi.setActiveTools(toolsBeforeRestrict.filter((name) => !RESTRICTED_TOOLS.has(name)));
-  }
-
-  function statusText() {
-    const tools = pi.getActiveTools();
-    const toolList = tools.length > 0 ? tools.join(", ") : "(none)";
-    if (machineAccess) {
-      return `Machine access is ON. You can use the machine. Active tools: ${toolList}. The user controls machine access (Ctrl+;). They can turn it off before a message or while you are looping. Do not assume it stays on. If a later turn says it is off, stop using read/write/edit/bash and ask for a follow-up after they toggle.`;
-    }
-    return `Machine access is OFF. You do not have read, write, edit, or bash. Active tools: ${toolList}. The user controls this (Ctrl+;). They can turn it on before a message or while you are looping. Do not try those tools, and do not assume access stays off. If you need them, ask the user to toggle machine access and send a follow-up.`;
   }
 
   function updateStatus(ctx: ExtensionContext) {
@@ -50,20 +48,48 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  function notify(ctx: ExtensionContext) {
-    updateStatus(ctx);
-  }
-
   function toggle(ctx: ExtensionContext) {
     machineAccess = !machineAccess;
     applyTools();
     persist();
-    notify(ctx);
+    updateStatus(ctx);
+  }
+
+  function stateLine() {
+    const tools = pi.getActiveTools();
+    const toolList = tools.length > 0 ? tools.join(",") : "none";
+    return `[state_changed] machine_access=${machineAccess ? "ON" : "OFF"} tools=${toolList} as of this message`;
+  }
+
+  function injectStateChanged(payload: unknown): unknown {
+    if (!payload || typeof payload !== "object") return payload;
+    const p = { ...(payload as Record<string, unknown>) };
+    const line = stateLine();
+
+    for (const key of ["input", "messages"] as const) {
+      const list = p[key];
+      if (!Array.isArray(list)) continue;
+      const next = list.slice();
+      let lastUser = -1;
+      for (let i = 0; i < next.length; i++) {
+        const item = next[i];
+        if (item && typeof item === "object" && (item as { role?: unknown }).role === "user") {
+          lastUser = i;
+        }
+      }
+      next.splice(lastUser >= 0 ? lastUser + 1 : next.length, 0, {
+        role: key === "input" ? "developer" : "system",
+        content: line,
+      });
+      p[key] = next;
+    }
+    return p;
   }
 
   pi.on("session_start", (_event, ctx) => {
     machineAccess = true;
     toolsBeforeRestrict = undefined;
+    lastAnnounced = undefined;
 
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== CUSTOM_TYPE) continue;
@@ -74,22 +100,23 @@ export default function (pi: ExtensionAPI) {
     }
 
     applyTools();
-    notify(ctx);
+    updateStatus(ctx);
   });
 
-  // Per-turn, not persisted. Mid-loop toggle is visible on the next LLM call.
-  pi.on("context", (event) => ({
-    messages: [
-      ...event.messages.filter((m) => m.role !== "custom" || m.customType !== STATUS_TYPE),
-      {
-        role: "custom" as const,
-        customType: STATUS_TYPE,
-        content: statusText(),
-        display: false,
-        timestamp: Date.now(),
-      },
-    ],
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: `${event.systemPrompt}\n\n${SYSTEM_NOTE}`,
   }));
+
+  pi.on("before_provider_request", (event) => {
+    if (lastAnnounced === undefined && machineAccess) {
+      lastAnnounced = true;
+      return;
+    }
+    if (lastAnnounced === machineAccess) return;
+    const payload = injectStateChanged(event.payload);
+    lastAnnounced = machineAccess;
+    return payload;
+  });
 
   pi.registerShortcut("ctrl+;", {
     description: "Toggle machine access (read/write/edit/bash)",
